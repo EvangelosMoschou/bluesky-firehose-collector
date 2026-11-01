@@ -12,8 +12,8 @@ TARGET := firehose_collector
 
 all: $(TARGET)
 
-$(TARGET): firehose_collector.c jsmn.h
-	$(CC) $(CFLAGS) -o $@ firehose_collector.c $(LDLIBS)
+$(TARGET): firehose_collector.c jetstream_classify.c jsmn.h jetstream_classify.h
+	$(CC) $(CFLAGS) -o $@ firehose_collector.c jetstream_classify.c $(LDLIBS)
 
 clean:
 	rm -f $(TARGET)

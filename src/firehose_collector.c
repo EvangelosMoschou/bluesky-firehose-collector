@@ -34,7 +34,7 @@
 #include <sys/un.h>
 #include <libwebsockets.h>
 
-#include "jsmn.h"
+#include "jetstream_classify.h"
 
 #define JETSTREAM_URL "jetstream1.us-east.bsky.network"
 #define JETSTREAM_PORT 443
@@ -306,16 +306,9 @@ static void *producer_thread(void *arg) {
 
 /* ---------------- Consumer thread (event-driven, no I/O) ---------------- */
 
-static int json_string_eq(const char *json, const jsmntok_t *tok, const char *s) {
-    return tok->type == JSMN_STRING &&
-           (int)strlen(s) == tok->end - tok->start &&
-           strncmp(json + tok->start, s, tok->end - tok->start) == 0;
-}
-
 static void *consumer_thread(void *arg) {
     (void)arg;
     char frame[MAX_FRAME_SIZE];
-    jsmntok_t tokens[256];
 
     heartbeat_update(&hb_consumer);
     while (!shutdown_requested) {
@@ -334,7 +327,8 @@ static void *consumer_thread(void *arg) {
             pthread_mutex_unlock(&fq.mut);
             break;
         }
-        memcpy(frame, fq.buf[fq.head], (size_t)fq.len[fq.head] + 1);
+        size_t frame_len = (size_t)fq.len[fq.head];
+        memcpy(frame, fq.buf[fq.head], frame_len + 1);
         fq.head = (fq.head + 1) % QUEUE_SLOTS;
         fq.count--;
         pthread_cond_signal(&fq.notFull);
@@ -342,46 +336,15 @@ static void *consumer_thread(void *arg) {
 
         heartbeat_update(&hb_consumer);
 
-        /* classify by top-level "kind" (JSMN_PARENT_LINKS: top-level keys
-         * are STRING tokens with parent == 0, the root object) */
-        memset(tokens, 0, sizeof(tokens));
-        jsmn_parser p;
-        jsmn_init(&p);
-        int r = jsmn_parse(&p, frame, strlen(frame), tokens, 256);
-        /* r < 0 means the frame hit MAX_FRAME_SIZE or ran out of token slots.
-         * Whatever was parsed is still valid and "kind" sits near the front
-         * of a jetstream message, so classify on it instead of discarding. */
-        if (r < 0) r = 256;
-        if (tokens[0].type != JSMN_OBJECT) {
-            pthread_mutex_lock(&counters_mut);
-            c_info++;
-            pthread_mutex_unlock(&counters_mut);
-            continue;
+        int kind = jetstream_classify(frame, frame_len);
+        pthread_mutex_lock(&counters_mut);
+        switch (kind) {
+        case JETSTREAM_COMMIT:   c_commit++;   break;
+        case JETSTREAM_IDENTITY: c_identity++; break;
+        case JETSTREAM_ACCOUNT:  c_account++;  break;
+        default:                 c_info++;     break;
         }
-        int kind_found = 0;
-        for (int i = 1; i + 1 < r && tokens[i].type != JSMN_UNDEFINED; i++) {
-            if (tokens[i].parent == 0 && tokens[i].type == JSMN_STRING &&
-                json_string_eq(frame, &tokens[i], "kind")) {
-                kind_found = 1;
-                const jsmntok_t *val = &tokens[i + 1];
-                pthread_mutex_lock(&counters_mut);
-                if (json_string_eq(frame, val, "commit"))
-                    c_commit++;
-                else if (json_string_eq(frame, val, "identity"))
-                    c_identity++;
-                else if (json_string_eq(frame, val, "account"))
-                    c_account++;
-                else
-                    c_info++;
-                pthread_mutex_unlock(&counters_mut);
-                break;
-            }
-        }
-        if (!kind_found) {
-            pthread_mutex_lock(&counters_mut);
-            c_info++;
-            pthread_mutex_unlock(&counters_mut);
-        }
+        pthread_mutex_unlock(&counters_mut);
     }
     return NULL;
 }
